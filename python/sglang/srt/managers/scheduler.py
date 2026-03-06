@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import csv
 import faulthandler
 import logging
 import os
@@ -314,6 +315,10 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
+        self.enable_throughput_logging = server_args.enable_throughput_logging
+        self.throughput_log_path = "throughput_log.csv"
+        self.throughput_log_file = None
+        self.throughput_log_writer = None
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -369,6 +374,9 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
+
+        # Init throughput logging (needs KV cache allocator)
+        self.init_throughput_logging()
 
         # Init running status
         self.init_running_status()
@@ -744,6 +752,30 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
+    def init_throughput_logging(self):
+        if not self.enable_throughput_logging:
+            return
+        if self.tp_rank != 0 or self.pp_rank != 0 or self.attn_tp_rank != 0:
+            return
+
+        log_path = os.path.abspath(self.throughput_log_path)
+        need_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+        self.throughput_log_file = open(log_path, "a", newline="")
+        self.throughput_log_writer = csv.writer(self.throughput_log_file)
+
+        if need_header:
+            self.throughput_log_writer.writerow(
+                [
+                    "timestamp",
+                    "prefill_tokens",
+                    "decode_tokens",
+                    "batch_size",
+                    "forward_time_s",
+                    "kv_utilization",
+                ]
+            )
+            self.throughput_log_file.flush()
+
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -759,6 +791,21 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        initial_tau = self.server_args.max_tokens_per_iteration or self.max_prefill_tokens
+        self.current_max_tokens_per_iteration = initial_tau
+        self.min_tokens_per_iteration = (
+            self.server_args.min_tokens_per_iteration
+            if self.server_args.min_tokens_per_iteration is not None
+            else 0
+        )
+        self.max_tokens_per_iteration = (
+            self.server_args.max_tokens_per_iteration
+            if self.server_args.max_tokens_per_iteration is not None
+            else initial_tau
+        )
+        self.target_iteration_time_s = None
+        self.iteration_time_sum_s = 0.0
+        self.iteration_time_count = 0
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1193,16 +1240,6 @@ class Scheduler(
                 self.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
-        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
-        # This might slightly hurt the throughput, so we use an environment variable to control it.
-        disable_overlap_for_batch = (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch
-            and batch.forward_mode.is_extend()
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
-        )
-
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
@@ -1214,7 +1251,7 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -1968,10 +2005,10 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
-        return res
+        del running_bs
+        if self.req_to_token_pool is None:
+            return 0
+        return self.req_to_token_pool.available_size()
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
@@ -2043,6 +2080,11 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        max_tokens_per_iteration = self.current_max_tokens_per_iteration
+        decode_count = running_bs
+        remaining_budget = max(max_tokens_per_iteration - decode_count, 0)
+        prefill_budget = min(self.max_prefill_tokens, remaining_budget)
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2050,7 +2092,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            prefill_budget,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -2280,6 +2322,84 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _get_iteration_token_counts(self, batch: ScheduleBatch) -> Tuple[int, int]:
+        if batch is None:
+            return 0, 0
+
+        prefill_tokens = 0
+        decode_tokens = 0
+
+        if batch.forward_mode.is_mixed():
+            decode_tokens = len(batch.decoding_reqs) if batch.decoding_reqs else 0
+            prefill_tokens = max((batch.extend_num_tokens or 0) - decode_tokens, 0)
+        elif batch.forward_mode.is_extend():
+            prefill_tokens = batch.extend_num_tokens or 0
+        elif batch.forward_mode.is_decode():
+            decode_tokens = batch.extend_num_tokens or 0
+        elif batch.forward_mode.is_prebuilt():
+            decode_tokens = batch.batch_size()
+
+        return prefill_tokens, decode_tokens
+
+    def _get_kv_utilization(self) -> float:
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is None:
+            return 0.0
+        total = getattr(allocator, "size", 0)
+        if total <= 0:
+            return 0.0
+        available = allocator.available_size()
+        used = max(total - available, 0)
+        return used / total
+
+    def _maybe_log_throughput(self, batch: ScheduleBatch, forward_time_s: float):
+        if self.throughput_log_writer is None or batch is None:
+            return
+
+        prefill_tokens, decode_tokens = self._get_iteration_token_counts(batch)
+        batch_size = batch.batch_size()
+        kv_utilization = self._get_kv_utilization()
+
+        self.throughput_log_writer.writerow(
+            [
+                time.time(),
+                prefill_tokens,
+                decode_tokens,
+                batch_size,
+                forward_time_s,
+                kv_utilization,
+            ]
+        )
+        self.throughput_log_file.flush()
+
+    def _maybe_update_tau(self, forward_time_s: float):
+        if forward_time_s <= 0:
+            return
+
+        if self.iteration_time_count < 10:
+            self.iteration_time_sum_s += forward_time_s
+            self.iteration_time_count += 1
+            if self.iteration_time_count == 10:
+                self.target_iteration_time_s = (
+                    self.iteration_time_sum_s / self.iteration_time_count
+                )
+            return
+
+        if self.target_iteration_time_s is None:
+            return
+
+        current_tau = self.current_max_tokens_per_iteration
+        if forward_time_s < self.target_iteration_time_s:
+            next_tau = int(current_tau * 1.05)
+        else:
+            next_tau = int(current_tau * 0.95)
+        if next_tau == current_tau:
+            next_tau = current_tau + (1 if forward_time_s < self.target_iteration_time_s else -1)
+        self.current_max_tokens_per_iteration = max(
+            self.min_tokens_per_iteration,
+            min(self.max_tokens_per_iteration, next_tau),
+        )
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2298,118 +2418,129 @@ class Scheduler(
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
-        # Place holder handling for pd-disagg decode event loop
-        if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+        forward_start = time.perf_counter()
+        try:
+            # Place holder handling for pd-disagg decode event loop
+            if batch.forward_mode.is_prebuilt():
+                return self._run_batch_prebuilt(batch)
 
-        # Run forward
-        if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
-            else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
-                worker_batch_or_batch = batch
+            # Run forward
+            if self.is_generation:
+                if self.spec_algorithm.is_none() or self.enable_overlap:
+                    # In most cases, we use the model worker batch to run the forward.
+                    worker_batch_or_batch = batch.get_model_worker_batch()
+                else:
+                    # In speculative decoding v1 (non-overlap) case, we use the batch directly.
+                    # TODO(lsyin): delete this branch after unifying the abstraction.
+                    worker_batch_or_batch = batch
 
-            if self.enable_overlap:
-                model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                if self.enable_overlap:
+                    model_worker_batch = worker_batch_or_batch
+                    self.record_batch_in_overlap(model_worker_batch)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
+                    # Sampling info will be modified during forward, so we store a copy.
+                    model_worker_batch.sampling_info = (
+                        model_worker_batch.sampling_info.copy_for_forward()
+                    )
 
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
+                    bs = len(model_worker_batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(model_worker_batch)
+                        with self.record_forward_metrics(batch):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                model_worker_batch
+                                # here pp is not compatible with overlap
+                            )
+                        # FIXME(lsyin): maybe move this to forward_batch_generation
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob
+                            )
+                        else:
+                            batch_result.future_indices = future_indices
+
+                    # FIXME(lsyin): move this assignment elsewhere
+                    future_indices_or_next_token_ids = -future_indices.indices
+
+                    if batch.is_spec_v2:
+                        # FIXME(lsyin): tmp code for spec v2
+                        # We only keep future indices for next draft input
+
+                        batch.spec_info = batch_result.next_draft_input
+                        batch.spec_info.future_indices = future_indices
+
+                        # batch.spec_info = EagleDraftInput(
+                        #     future_indices=future_indices,
+                        #     verify_done=batch_result.next_draft_input.verify_done,
+                        # )
+
+                        # The future value, usually for next batch preparation
+                        # Current implementation strictly synchronizes the seq_lens
+                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                else:
+                    kwargs = (
+                        {"pp_proxy_tensors": pp_proxy_tensors}
+                        if self.spec_algorithm.is_none()
+                        else {}
+                    )
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
+                            worker_batch_or_batch, **kwargs
                         )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
-                    else:
-                        batch_result.future_indices = future_indices
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                    self.update_cache_from_scheduler(batch, batch_result)
 
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
+                #       which can probably be replaced by future_indices later [TODO(lsyin)].
+                #       we shall still keep the original outputs, e.g. next_token_ids
+                #       in the GenerationBatchOutput for processing after copy_done.
+                batch.output_ids = future_indices_or_next_token_ids
 
-                if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
+                # These 2 values are needed for processing the output, but the values can be
+                # modified by overlap schedule. So we have to copy them here so that
+                # we can use the correct values in output processing.
+                if batch.return_logprob:
+                    batch_result.extend_input_len_per_req = [
+                        req.extend_input_len for req in batch.reqs
+                    ]
+                    batch_result.extend_logprob_start_len_per_req = [
+                        req.extend_logprob_start_len for req in batch.reqs
+                    ]
+                else:
+                    batch_result.extend_input_len_per_req = None
+                    batch_result.extend_logprob_start_len_per_req = None
 
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                ret = batch_result
+            else:  # embedding or reward model
+                model_worker_batch = batch.get_model_worker_batch()
 
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                future_indices_or_next_token_ids = batch_result.next_token_ids
-            else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
-                with self.record_forward_metrics(batch):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        worker_batch_or_batch, **kwargs
-                    )
-                future_indices_or_next_token_ids = batch_result.next_token_ids
-                self.update_cache_from_scheduler(batch, batch_result)
-
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
-
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
-            if batch.return_logprob:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
-                ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
-            else:
-                batch_result.extend_input_len_per_req = None
-                batch_result.extend_logprob_start_len_per_req = None
-
-            ret = batch_result
-        else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-
-            if self.enable_overlap:
-                self.record_batch_in_overlap(model_worker_batch)
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                if self.enable_overlap:
+                    self.record_batch_in_overlap(model_worker_batch)
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        embeddings = self.tp_worker.forward_batch_embedding(
+                            model_worker_batch
+                        )
+                        ret = EmbeddingBatchResult(embeddings=embeddings)
+                        ret.copy_to_cpu()
+                else:
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
                     )
                     ret = EmbeddingBatchResult(embeddings=embeddings)
-                    ret.copy_to_cpu()
-            else:
-                embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-                ret = EmbeddingBatchResult(embeddings=embeddings)
+        finally:
+            forward_time_s = time.perf_counter() - forward_start
+            self._maybe_log_throughput(batch, forward_time_s)
+            if batch is not None:
+                self._maybe_update_tau(forward_time_s)
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:

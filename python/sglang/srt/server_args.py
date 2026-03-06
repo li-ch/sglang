@@ -334,9 +334,11 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
-    chunked_prefill_size: Optional[int] = None
+    chunked_prefill_size: Optional[int] = -1
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
+    max_tokens_per_iteration: Optional[int] = None
+    min_tokens_per_iteration: Optional[int] = None
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -404,6 +406,7 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    enable_throughput_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -888,6 +891,8 @@ class ServerArgs:
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
     def _handle_prefill_delayer_env_compat(self):
+        if not self.enable_prefill_delayer:
+            return
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.enable_prefill_delayer = True
         if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
@@ -1116,11 +1121,17 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
+            effective_chunked_prefill_size = (
+                self.chunked_prefill_size
+                if self.chunked_prefill_size is not None
+                and self.chunked_prefill_size > 0
+                else 2048
+            )
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set the max tokens to 2048 by default.
             if not self.use_mla_backend():
-                self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+                self.piecewise_cuda_graph_max_tokens = effective_chunked_prefill_size
             else:
                 self.piecewise_cuda_graph_max_tokens = 2048
 
@@ -3461,6 +3472,18 @@ class ServerArgs:
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
         )
         parser.add_argument(
+            "--max-tokens-per-iteration",
+            type=int,
+            default=ServerArgs.max_tokens_per_iteration,
+            help="The maximum number of tokens per iteration before subtracting decode tokens. Defaults to max_prefill_tokens when unset.",
+        )
+        parser.add_argument(
+            "--min-tokens-per-iteration",
+            type=int,
+            default=ServerArgs.min_tokens_per_iteration,
+            help="The minimum number of tokens per iteration for adaptive tau. Defaults to 0 when unset.",
+        )
+        parser.add_argument(
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
@@ -3872,6 +3895,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--enable-throughput-logging",
+            action="store_true",
+            default=ServerArgs.enable_throughput_logging,
+            help="Enable per-iteration throughput logging to CSV.",
         )
         parser.add_argument(
             "--kv-events-config",
