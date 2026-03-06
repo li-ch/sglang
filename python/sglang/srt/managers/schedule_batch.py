@@ -1830,21 +1830,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = list(range(len(self.reqs)))
-
-        # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter
-        # requests from the back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract
-        # policy.
-        if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+        sorted_indices = self._get_retract_sorted_indices(server_args)
 
         retracted_reqs = []
         first_iter = True
@@ -1886,13 +1872,49 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, []
 
+    def _get_retract_sorted_indices(self, server_args: ServerArgs) -> List[int]:
+        sorted_indices = list(range(len(self.reqs)))
+
+        # TODO(lsyin): improve retraction policy for radix cache
+        # For spec decoding, filter_batch API can only filter
+        # requests from the back, so we can only retract from the back.
+        # TODO(sang): Clean up finish path and support better retract
+        # policy.
+        if not server_args.speculative_algorithm:
+            if server_args.enable_priority_scheduling:
+                if server_args.schedule_low_priority_values_first:
+                    priority_key = lambda r: -(r.priority or 0)
+                else:
+                    priority_key = lambda r: r.priority or 0
+                sorted_indices.sort(
+                    key=lambda i: (
+                        priority_key(self.reqs[i]),
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+            else:
+                sorted_indices.sort(
+                    key=lambda i: (
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
+
+        return sorted_indices
+
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
-        if server_args.disaggregation_mode == "decode":
+        try:
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
+        except (AssertionError, AttributeError):
+            # KV cache copy is not enabled on this allocator.
+            pass
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.

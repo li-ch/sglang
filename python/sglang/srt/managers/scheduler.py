@@ -1699,6 +1699,18 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Conservative admission check based on projected total tokens.
+        projected_total_tokens = len(req.origin_input_ids) + req.sampling_params.max_new_tokens
+        if projected_total_tokens > self.max_total_num_tokens:
+            req.set_finish_with_abort(
+                error_msg=(
+                    "Projected request length exceeds KV cache capacity. "
+                    f"{projected_total_tokens=} > {self.max_total_num_tokens=}."
+                )
+            )
+            self._add_request_to_queue(req)
+            return
+
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1

@@ -583,13 +583,14 @@ class RadixCache(BasePrefixCache):
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node), len(node.key), node)
+            for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _priority, _key_len, x = heapq.heappop(eviction_heap)
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -597,7 +598,7 @@ class RadixCache(BasePrefixCache):
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                heapq.heappush(eviction_heap, (new_priority, len(x.parent.key), x.parent))
 
             self._record_remove_event(x)
 

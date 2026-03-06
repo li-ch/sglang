@@ -1212,6 +1212,9 @@ class ServerArgs:
                 else 0.88
             )
 
+            # Increase default utilization target for throughput.
+            self.mem_fraction_static = max(self.mem_fraction_static, 0.95)
+
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
