@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionBatchRequest,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -43,6 +44,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -281,6 +283,7 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        priority = self._resolve_priority(request, raw_request)
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -304,7 +307,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
-            priority=request.priority,
+            priority=priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -314,6 +317,62 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return adapted_request, request
+
+    def _resolve_priority(
+        self, request: ChatCompletionRequest, raw_request: Optional[Request]
+    ) -> Optional[int]:
+        if request.priority is not None:
+            return request.priority
+        if isinstance(request.sampling_params, dict) and "priority" in request.sampling_params:
+            return request.sampling_params.get("priority")
+        header_priority = self._get_header_priority(raw_request)
+        if header_priority is not None:
+            return header_priority
+        return None
+
+    def _get_header_priority(self, raw_request: Optional[Request]) -> Optional[int]:
+        if raw_request is None:
+            return None
+        value = raw_request.headers.get("x-priority")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError("Invalid x-priority header; must be an integer.") from exc
+
+    async def handle_batch_request(
+        self, request: ChatCompletionBatchRequest, raw_request: Request
+    ) -> Union[List[ChatCompletionResponse], ErrorResponse, ORJSONResponse]:
+        if not request.requests:
+            return self.create_error_response("Batch requests cannot be empty.")
+        header_priority = self._get_header_priority(raw_request)
+        responses: List[ChatCompletionResponse] = []
+        received_time = monotonic_time()
+        for sub_request in request.requests:
+            if sub_request.stream:
+                return self.create_error_response(
+                    "Streaming is not supported for batch chat completions."
+                )
+            if sub_request.priority is None and isinstance(sub_request.sampling_params, dict):
+                sub_request.priority = sub_request.sampling_params.get("priority")
+            if sub_request.priority is None and header_priority is not None:
+                sub_request.priority = header_priority
+
+            error_msg = self._validate_request(sub_request)
+            if error_msg:
+                return self.create_error_response(error_msg)
+
+            adapted_request, processed_request = self._convert_to_internal_request(
+                sub_request, raw_request
+            )
+            adapted_request.received_time = received_time
+            response = await self._handle_non_streaming_request(
+                adapted_request, processed_request, raw_request
+            )
+            responses.append(response)
+
+        return responses
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool

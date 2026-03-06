@@ -622,6 +622,7 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    sampling_params: Optional[Dict[str, Any]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -859,6 +860,10 @@ class ChatCompletionResponse(BaseModel):
         if self.sglext is None:
             data.pop("sglext", None)
         return data
+
+
+class ChatCompletionBatchRequest(BaseModel):
+    requests: List[ChatCompletionRequest]
 
 
 class DeltaMessage(BaseModel):

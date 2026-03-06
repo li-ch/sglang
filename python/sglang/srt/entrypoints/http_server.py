@@ -79,6 +79,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionBatchRequest,
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
@@ -1408,6 +1409,20 @@ async def openai_v1_chat_completions(
 ):
     """OpenAI-compatible chat completion endpoint."""
     return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/chat/completions/batch",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_completions_batch(
+    request: ChatCompletionBatchRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion batch endpoint (non-streaming)."""
+    return await raw_request.app.state.openai_serving_chat.handle_batch_request(
         request, raw_request
     )
 
