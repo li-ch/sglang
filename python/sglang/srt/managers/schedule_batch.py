@@ -1082,6 +1082,8 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        if hasattr(self, "kv_cache_cpu"):
+            del self.kv_cache_cpu
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -1908,13 +1910,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
-        try:
-            req.offload_kv_cache(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
-        except (AssertionError, AttributeError):
-            # KV cache copy is not enabled on this allocator.
-            pass
+        # Retraction path re-prefills requests from scratch, so avoid opportunistic
+        # offload unless decode disaggregation explicitly enables reload semantics.
+        if getattr(server_args, "disaggregation_decode_enable_offload_kvcache", False):
+            try:
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+            except (AssertionError, AttributeError, NotImplementedError):
+                # KV cache copy is not enabled on this allocator.
+                pass
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.

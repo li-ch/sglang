@@ -34,6 +34,25 @@ Run a basic benchmark against an sglang server exposing `/generate`:
 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 ```
 
+For throughput-oriented benchmarking (non-streaming batch workloads), prefer:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-throughput-mode
+```
+
+Throughput mode sets throughput-friendly scheduling defaults:
+- Switch default `schedule_policy` from `fcfs` to `lpm` (unless overridden).
+- Disable prefill delayer by default to avoid latency-oriented throttling.
+- Keep explicit user caps (for example, `--prefill-max-requests`) when provided.
+
+Note on caps:
+- `max_running_requests` remains a safety/memory cap.
+- `prefill_max_requests` is a user cap if explicitly set.
+- `pp_max_micro_batch_size` is retained for pipeline-parallel control paths, while
+  prefill admission is still primarily bounded by request-pool availability.
+
 ```bash
 python3 -m sglang.bench_serving \
   --backend sglang \

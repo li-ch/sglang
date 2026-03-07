@@ -1,11 +1,13 @@
 import unittest
 import uuid
+from time import perf_counter
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionBatchItem,
     ChatCompletionBatchRequest,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -160,6 +162,120 @@ class TestChatBatchPriority(unittest.TestCase):
                 self.chat.handle_batch_request(batch, self.fastapi_request)
             )
         self.assertEqual(len(responses), 1)
+        self.assertIsInstance(responses[0], ChatCompletionBatchItem)
+        self.assertIsNotNone(responses[0].response)
+        self.assertIsNone(responses[0].error)
+
+    def test_batch_returns_per_item_error_for_streaming_subrequest(self):
+        batch = ChatCompletionBatchRequest(
+            requests=[
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=True,
+                ),
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stream=False,
+                ),
+            ]
+        )
+
+        async def _fake_non_streaming(*_args, **_kwargs):
+            return ChatCompletionResponse(
+                id="chatcmpl-test",
+                created=123,
+                model="x",
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="ok"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        loop = get_or_create_event_loop()
+        with patch.object(self.chat, "_process_messages") as proc_mock, patch.object(
+            self.chat, "_handle_non_streaming_request", side_effect=_fake_non_streaming
+        ):
+            proc_mock.return_value = self._mock_message_processing()
+            responses = loop.run_until_complete(
+                self.chat.handle_batch_request(batch, self.fastapi_request)
+            )
+
+        self.assertEqual(len(responses), 2)
+        self.assertIsNotNone(responses[0].error)
+        self.assertIn("Streaming is not supported", responses[0].error.message)
+        self.assertIsNotNone(responses[1].response)
+
+    def test_batch_invalid_header_priority_returns_400(self):
+        batch = ChatCompletionBatchRequest(
+            requests=[
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=False,
+                )
+            ]
+        )
+        self.fastapi_request.headers = {"x-priority": "not-an-int"}
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.chat.handle_batch_request(batch, self.fastapi_request)
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_batch_requests_are_processed_concurrently(self):
+        batch = ChatCompletionBatchRequest(
+            requests=[
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "A"}],
+                    stream=False,
+                ),
+                ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "B"}],
+                    stream=False,
+                ),
+            ]
+        )
+
+        import asyncio
+
+        async def _fake_non_streaming(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            return ChatCompletionResponse(
+                id="chatcmpl-test",
+                created=123,
+                model="x",
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="ok"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        loop = get_or_create_event_loop()
+        with patch.object(self.chat, "_process_messages") as proc_mock, patch.object(
+            self.chat, "_handle_non_streaming_request", side_effect=_fake_non_streaming
+        ):
+            proc_mock.return_value = self._mock_message_processing()
+            start = perf_counter()
+            responses = loop.run_until_complete(
+                self.chat.handle_batch_request(batch, self.fastapi_request)
+            )
+            elapsed = perf_counter() - start
+
+        self.assertEqual(len(responses), 2)
+        # Sequential would be ~=0.10s; concurrency should stay near a single sleep.
+        self.assertLess(elapsed, 0.09)
 
 
 if __name__ == "__main__":

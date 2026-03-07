@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -16,6 +17,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionBatchItem,
     ChatCompletionBatchRequest,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -341,28 +343,39 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as exc:
             raise ValueError("Invalid x-priority header; must be an integer.") from exc
 
-    async def handle_batch_request(
-        self, request: ChatCompletionBatchRequest, raw_request: Request
-    ) -> Union[List[ChatCompletionResponse], ErrorResponse, ORJSONResponse]:
-        if not request.requests:
-            return self.create_error_response("Batch requests cannot be empty.")
-        header_priority = self._get_header_priority(raw_request)
-        responses: List[ChatCompletionResponse] = []
-        received_time = monotonic_time()
-        for sub_request in request.requests:
-            if sub_request.stream:
-                return self.create_error_response(
-                    "Streaming is not supported for batch chat completions."
-                )
-            if sub_request.priority is None and isinstance(sub_request.sampling_params, dict):
-                sub_request.priority = sub_request.sampling_params.get("priority")
-            if sub_request.priority is None and header_priority is not None:
-                sub_request.priority = header_priority
+    @staticmethod
+    def _build_batch_error(
+        index: int,
+        message: str,
+        *,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> ChatCompletionBatchItem:
+        return ChatCompletionBatchItem(
+            index=index,
+            error=ErrorResponse(
+                message=message, type=err_type, param=None, code=status_code
+            ),
+        )
 
-            error_msg = self._validate_request(sub_request)
-            if error_msg:
-                return self.create_error_response(error_msg)
+    async def _handle_single_batch_subrequest(
+        self,
+        index: int,
+        sub_request: ChatCompletionRequest,
+        raw_request: Request,
+        received_time: float,
+    ) -> ChatCompletionBatchItem:
+        if sub_request.stream:
+            return self._build_batch_error(
+                index,
+                "Streaming is not supported for batch chat completions.",
+            )
 
+        error_msg = self._validate_request(sub_request)
+        if error_msg:
+            return self._build_batch_error(index, error_msg)
+
+        try:
             adapted_request, processed_request = self._convert_to_internal_request(
                 sub_request, raw_request
             )
@@ -370,9 +383,76 @@ class OpenAIServingChat(OpenAIServingBase):
             response = await self._handle_non_streaming_request(
                 adapted_request, processed_request, raw_request
             )
-            responses.append(response)
+        except ValueError as exc:
+            return self._build_batch_error(index, str(exc))
+        except Exception as exc:
+            logger.exception("Error while handling batch sub-request index=%s", index)
+            return self._build_batch_error(
+                index,
+                f"Internal server error: {str(exc)}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
 
-        return responses
+        if isinstance(response, ChatCompletionResponse):
+            return ChatCompletionBatchItem(index=index, response=response)
+
+        if isinstance(response, ErrorResponse):
+            return ChatCompletionBatchItem(index=index, error=response)
+
+        if isinstance(response, ORJSONResponse):
+            try:
+                payload = orjson.loads(response.body)
+            except Exception:
+                return self._build_batch_error(
+                    index,
+                    "Internal server error: invalid ORJSONResponse body in batch path.",
+                    err_type="InternalServerError",
+                    status_code=500,
+                )
+
+            if "error" in payload and isinstance(payload["error"], dict):
+                return ChatCompletionBatchItem(
+                    index=index, error=ErrorResponse(**payload["error"])
+                )
+            if all(k in payload for k in ("id", "model", "choices", "usage")):
+                return ChatCompletionBatchItem(
+                    index=index, response=ChatCompletionResponse(**payload)
+                )
+
+            return self._build_batch_error(
+                index,
+                "Internal server error: unrecognized ORJSONResponse payload in batch path.",
+                err_type="InternalServerError",
+                status_code=500,
+            )
+
+        return self._build_batch_error(
+            index,
+            "Internal server error: unsupported batch sub-response type.",
+            err_type="InternalServerError",
+            status_code=500,
+        )
+
+    async def handle_batch_request(
+        self, request: ChatCompletionBatchRequest, raw_request: Request
+    ) -> Union[List[ChatCompletionBatchItem], ErrorResponse, ORJSONResponse]:
+        if not request.requests:
+            return self.create_error_response("Batch requests cannot be empty.")
+        try:
+            # Validate header once so malformed priority becomes a 4xx error.
+            self._get_header_priority(raw_request)
+        except ValueError as exc:
+            return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
+
+        received_time = monotonic_time()
+        tasks = [
+            self._handle_single_batch_subrequest(
+                idx, sub_request, raw_request, received_time
+            )
+            for idx, sub_request in enumerate(request.requests)
+        ]
+        return await asyncio.gather(*tasks)
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool

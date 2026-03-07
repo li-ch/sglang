@@ -791,7 +791,11 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
-        initial_tau = self.server_args.max_tokens_per_iteration or self.max_prefill_tokens
+        initial_tau = (
+            self.server_args.max_tokens_per_iteration
+            if self.server_args.max_tokens_per_iteration is not None
+            else self.max_prefill_tokens
+        )
         self.current_max_tokens_per_iteration = initial_tau
         self.min_tokens_per_iteration = (
             self.server_args.min_tokens_per_iteration
@@ -801,11 +805,13 @@ class Scheduler(
         self.max_tokens_per_iteration = (
             self.server_args.max_tokens_per_iteration
             if self.server_args.max_tokens_per_iteration is not None
-            else initial_tau
+            else max(initial_tau * 4, self.max_prefill_tokens)
         )
         self.target_iteration_time_s = None
         self.iteration_time_sum_s = 0.0
         self.iteration_time_count = 0
+        self.tau_warmup_iters = 10
+        self.tau_target_ema_alpha = 0.1
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -840,6 +846,23 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+        )
+        logger.info(
+            "Scheduler policy initialized: schedule_policy=%s, "
+            "enable_priority_scheduling=%s",
+            self.schedule_policy,
+            self.enable_priority_scheduling,
+        )
+        logger.info(
+            "Scheduler caps: throughput_mode=%s, prefill_delayer=%s, "
+            "prefill_max_requests=%s, pp_max_micro_batch_size=%s, "
+            "max_running_requests=%s (safety cap), "
+            "prefill admission limited by req_to_token_pool availability.",
+            self.server_args.enable_throughput_mode,
+            self.server_args.enable_prefill_delayer,
+            self.server_args.prefill_max_requests,
+            self.server_args.pp_max_micro_batch_size,
+            self.max_running_requests,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
@@ -1468,6 +1491,24 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+    def _get_admission_headroom_tokens(self) -> int:
+        available_tokens = 0
+        evictable_tokens = 0
+
+        if self.token_to_kv_pool_allocator is not None:
+            try:
+                available_tokens = int(self.token_to_kv_pool_allocator.available_size())
+            except Exception:
+                available_tokens = 0
+
+        if self.tree_cache is not None:
+            try:
+                evictable_tokens = int(self.tree_cache.evictable_size())
+            except Exception:
+                evictable_tokens = 0
+
+        return max(available_tokens + evictable_tokens, 0)
+
     def _process_and_broadcast_mm_inputs(
         self,
         raw_mm_inputs: Optional[dict],
@@ -1699,7 +1740,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Conservative admission check based on projected total tokens.
+        # Hard reject only requests that cannot fit even when the KV cache is fully
+        # available. Transient pressure should be handled by queueing/backpressure.
         projected_total_tokens = len(req.origin_input_ids) + req.sampling_params.max_new_tokens
         if projected_total_tokens > self.max_total_num_tokens:
             req.set_finish_with_abort(
@@ -1710,6 +1752,14 @@ class Scheduler(
             )
             self._add_request_to_queue(req)
             return
+
+        admission_headroom_tokens = self._get_admission_headroom_tokens()
+        if projected_total_tokens > admission_headroom_tokens:
+            logger.info(
+                "Admission backpressure: queuing request under transient KV pressure. "
+                f"{projected_total_tokens=} > {admission_headroom_tokens=}, "
+                f"{len(self.waiting_queue)=}, {self.max_queued_requests=}."
+            )
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -2427,10 +2477,10 @@ class Scheduler(
         if forward_time_s <= 0:
             return
 
-        if self.iteration_time_count < 10:
+        if self.iteration_time_count < self.tau_warmup_iters:
             self.iteration_time_sum_s += forward_time_s
             self.iteration_time_count += 1
-            if self.iteration_time_count == 10:
+            if self.iteration_time_count == self.tau_warmup_iters:
                 self.target_iteration_time_s = (
                     self.iteration_time_sum_s / self.iteration_time_count
                 )
@@ -2439,16 +2489,26 @@ class Scheduler(
         if self.target_iteration_time_s is None:
             return
 
+        prev_target_time = self.target_iteration_time_s
         current_tau = self.current_max_tokens_per_iteration
-        if forward_time_s < self.target_iteration_time_s:
+        if forward_time_s < prev_target_time:
             next_tau = int(current_tau * 1.05)
-        else:
+        elif forward_time_s > prev_target_time:
             next_tau = int(current_tau * 0.95)
+        else:
+            next_tau = current_tau
         if next_tau == current_tau:
-            next_tau = current_tau + (1 if forward_time_s < self.target_iteration_time_s else -1)
+            if forward_time_s < prev_target_time:
+                next_tau = current_tau + 1
+            elif forward_time_s > prev_target_time:
+                next_tau = current_tau - 1
         self.current_max_tokens_per_iteration = max(
             self.min_tokens_per_iteration,
             min(self.max_tokens_per_iteration, next_tau),
+        )
+        self.target_iteration_time_s = (
+            (1 - self.tau_target_ema_alpha) * prev_target_time
+            + self.tau_target_ema_alpha * forward_time_s
         )
 
     def run_batch(
@@ -2590,7 +2650,7 @@ class Scheduler(
         finally:
             forward_time_s = time.perf_counter() - forward_start
             self._maybe_log_throughput(batch, forward_time_s)
-            if batch is not None:
+            if batch is not None and batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_update_tau(forward_time_s)
 
         # Capture prefill end time for EXTEND mode

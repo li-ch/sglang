@@ -44,6 +44,48 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestThroughputModeSchedulePolicy(unittest.TestCase):
+    def test_throughput_mode_defaults_fcfs_to_lpm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_throughput_mode=True,
+        )
+        self.assertEqual(server_args.schedule_policy, "lpm")
+
+    def test_throughput_mode_respects_explicit_non_fcfs_policy(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_throughput_mode=True,
+            schedule_policy="dfs-weight",
+        )
+        self.assertEqual(server_args.schedule_policy, "dfs-weight")
+
+    def test_throughput_mode_does_not_override_priority_scheduling(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_throughput_mode=True,
+            enable_priority_scheduling=True,
+            schedule_policy="fcfs",
+        )
+        self.assertEqual(server_args.schedule_policy, "fcfs")
+
+    def test_throughput_mode_disables_prefill_delayer(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_throughput_mode=True,
+            enable_prefill_delayer=True,
+        )
+        self.assertFalse(server_args.enable_prefill_delayer)
+
+    def test_throughput_mode_keeps_explicit_prefill_max_requests(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_throughput_mode=True,
+            prefill_max_requests=8,
+        )
+        self.assertEqual(server_args.prefill_max_requests, 8)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

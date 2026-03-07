@@ -331,6 +331,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    throughput_mem_floor: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
@@ -340,6 +341,7 @@ class ServerArgs:
     max_tokens_per_iteration: Optional[int] = None
     min_tokens_per_iteration: Optional[int] = None
     prefill_max_requests: Optional[int] = None
+    enable_throughput_mode: bool = False
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
@@ -732,6 +734,7 @@ class ServerArgs:
 
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        self._handle_throughput_mode_schedule_policy()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -745,6 +748,7 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+        self._handle_throughput_mode_caps()
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -1212,14 +1216,23 @@ class ServerArgs:
                 else 0.88
             )
 
-            # Increase default utilization target for throughput.
-            self.mem_fraction_static = max(self.mem_fraction_static, 0.95)
-
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
             if model_config.is_multimodal and not self.language_only:
                 self.adjust_mem_fraction_for_vlm(model_config)
+
+        if self.throughput_mem_floor is not None:
+            old_mem_fraction_static = self.mem_fraction_static
+            self.mem_fraction_static = max(
+                self.mem_fraction_static, self.throughput_mem_floor
+            )
+            if self.mem_fraction_static != old_mem_fraction_static:
+                logger.warning(
+                    "Applying throughput memory floor override: "
+                    f"{old_mem_fraction_static=} -> {self.mem_fraction_static=} "
+                    f"(throughput_mem_floor={self.throughput_mem_floor})."
+                )
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
         if self.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
@@ -3164,6 +3177,43 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+    def _handle_throughput_mode_schedule_policy(self):
+        if not self.enable_throughput_mode:
+            return
+
+        if self.enable_priority_scheduling:
+            logger.info(
+                "Throughput mode is enabled but priority scheduling is active; "
+                "keeping existing schedule_policy=%s.",
+                self.schedule_policy,
+            )
+            return
+
+        if self.schedule_policy == "fcfs":
+            logger.info(
+                "Throughput mode is enabled; defaulting schedule_policy to 'lpm' "
+                "for cache-aware prefill ordering. Use --schedule-policy to override."
+            )
+            self.schedule_policy = "lpm"
+
+    def _handle_throughput_mode_caps(self):
+        if not self.enable_throughput_mode:
+            return
+
+        if self.enable_prefill_delayer:
+            logger.warning(
+                "Throughput mode disables prefill delayer to avoid latency-oriented "
+                "prefill throttling."
+            )
+            self.enable_prefill_delayer = False
+
+        if self.prefill_max_requests is not None:
+            logger.info(
+                "Throughput mode keeps explicit prefill_max_requests=%s as a "
+                "user-provided cap.",
+                self.prefill_max_requests,
+            )
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -3458,6 +3508,12 @@ class ServerArgs:
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         )
         parser.add_argument(
+            "--throughput-mem-floor",
+            type=float,
+            default=ServerArgs.throughput_mem_floor,
+            help="Optional floor for mem_fraction_static when running throughput-oriented workloads. Disabled by default.",
+        )
+        parser.add_argument(
             "--max-running-requests",
             type=int,
             default=ServerArgs.max_running_requests,
@@ -3526,6 +3582,12 @@ class ServerArgs:
                 "routing-key",
             ],
             help="The scheduling policy of the requests.",
+        )
+        parser.add_argument(
+            "--enable-throughput-mode",
+            action="store_true",
+            default=ServerArgs.enable_throughput_mode,
+            help="Enable throughput-oriented defaults. When priority scheduling is disabled and schedule-policy is default fcfs, use lpm for cached-prefix-aware ordering.",
         )
         parser.add_argument(
             "--enable-priority-scheduling",

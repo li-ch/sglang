@@ -866,6 +866,12 @@ class ChatCompletionBatchRequest(BaseModel):
     requests: List[ChatCompletionRequest]
 
 
+class ChatCompletionBatchItem(BaseModel):
+    index: int
+    response: Optional[ChatCompletionResponse] = None
+    error: Optional[ErrorResponse] = None
+
+
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None

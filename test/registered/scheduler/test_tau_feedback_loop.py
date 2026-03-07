@@ -26,6 +26,8 @@ class TestTauFeedbackLoop(CustomTestCase):
         scheduler.target_iteration_time_s = target_time_s
         scheduler.iteration_time_sum_s = sum_s
         scheduler.iteration_time_count = count
+        scheduler.tau_warmup_iters = 10
+        scheduler.tau_target_ema_alpha = 0.1
         return scheduler
 
     def test_target_time_estimated_after_10_iterations(self):
@@ -53,6 +55,20 @@ class TestTauFeedbackLoop(CustomTestCase):
         scheduler.current_max_tokens_per_iteration = 50
         scheduler._maybe_update_tau(2.0)
         self.assertEqual(scheduler.current_max_tokens_per_iteration, 50)
+
+    def test_tau_no_change_when_iteration_time_equals_target(self):
+        scheduler = self._make_scheduler(
+            current_tau=100, min_tau=50, max_tau=150, target_time_s=1.0
+        )
+        scheduler._maybe_update_tau(1.0)
+        self.assertEqual(scheduler.current_max_tokens_per_iteration, 100)
+
+    def test_target_time_updates_with_ema_after_warmup(self):
+        scheduler = self._make_scheduler(
+            current_tau=100, min_tau=50, max_tau=150, target_time_s=1.0
+        )
+        scheduler._maybe_update_tau(2.0)
+        self.assertAlmostEqual(scheduler.target_iteration_time_s, 1.1)
 
 
 if __name__ == "__main__":
